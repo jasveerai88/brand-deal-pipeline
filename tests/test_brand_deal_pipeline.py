@@ -18,6 +18,20 @@ Sample-board totals by hand: pitched 750 · negotiating 1,200 ·
 agreed 1,500+900 = 2,400 · delivered 2,000 · invoiced
 1,100+1,750 = 2,850 · paid 650 · dead 800 · delivered-but-unpaid
 2,000+2,850 = 4,850.
+Usage-rights math is likewise hand-worked for as-of 2026-11-04:
+    expiry 2026-11-03 -> expired, 1 day past (the expiry date is
+        the LAST day of the window, so expiry on 2026-11-04
+        itself is expiring with 0 days left, not expired)
+    expiry 2026-12-04 -> expiring, exactly 30 days left
+    expiry 2026-12-05 -> active, 31 days left
+    2026-01-31 + 1 month -> 2026-02-28 (clamped)
+    sample board: #5 start 2026-08-01 + 3 months -> expired
+        2026-11-01 (3 days past, $2,000) · #7 recorded expiry
+        2026-11-20 -> expiring (16 days, $1,750) · #6 start
+        2026-10-12 + 12 months -> active 2027-10-12 (342 days,
+        $1,100) · the other six deals record no window ->
+        no_expiry ($750+1,200+1,500+900+650+800 = $5,800) ·
+        renewal at stake 2,000+1,750 = $3,750.
 Both directions are covered: quiet boards exit 0, boards with
 action items exit 1, and every broken input exits 2 with a clean
 message — in text AND in --json mode — while a corrupt board file
@@ -562,6 +576,369 @@ class TestCliValidation(BoardCase):
         r = run_cli()
         self.assertEqual(r.returncode, 2)
         self.assertNotIn("Traceback", r.stdout + r.stderr)
+
+
+class TestUsageWindows(unittest.TestCase):
+    """Usage-window math against hand-computed values, as-of
+    2026-11-04 — never against the tool's own output."""
+
+    def norm(self, **over):
+        return bd.normalize_entry(entry(**over), 1)
+
+    def test_recorded_expiry_rules_over_computed(self):
+        e = self.norm(usage_start="2026-09-15", usage_months=3,
+                      usage_expires="2026-12-01")
+        expiry, source = bd.usage_expiry(e)
+        self.assertEqual(expiry.isoformat(), "2026-12-01")
+        self.assertEqual(source, "recorded")
+
+    def test_computed_expiry_is_start_plus_months(self):
+        e = self.norm(usage_start="2026-09-15", usage_months=3)
+        expiry, source = bd.usage_expiry(e)
+        self.assertEqual(expiry.isoformat(), "2026-12-15")
+        self.assertEqual(source, "computed")
+
+    def test_month_addition_clamps_to_month_length(self):
+        cases = [("2026-01-31", 1, "2026-02-28"),
+                 ("2025-12-31", 2, "2026-02-28"),
+                 ("2026-10-31", 4, "2027-02-28"),
+                 ("2026-03-31", 1, "2026-04-30"),
+                 ("2024-01-31", 1, "2024-02-29"),  # leap year
+                 ("2026-11-04", 12, "2027-11-04")]
+        for start, months, expected in cases:
+            got = bd._add_months(date.fromisoformat(start), months)
+            self.assertEqual(got.isoformat(), expected,
+                             (start, months))
+
+    def test_state_boundaries_exact(self):
+        cases = [
+            ("2026-11-03", ("expired", -1)),   # day before: expired
+            ("2026-11-04", ("expiring", 0)),   # expiry day: last day
+            ("2026-11-05", ("expiring", 1)),
+            ("2026-12-04", ("expiring", 30)),  # exact 30: expiring
+            ("2026-12-05", ("active", 31)),    # 31: active
+            ("2027-11-04", ("active", 365)),
+        ]
+        for expires, expected in cases:
+            e = self.norm(usage_expires=expires)
+            self.assertEqual(bd.rights_state(e, TODAY), expected,
+                             expires)
+
+    def test_no_fields_means_unknown_never_guessed(self):
+        # a due date and an old invoice say nothing about usage
+        e = self.norm(due="2026-01-01")
+        self.assertEqual(bd.usage_expiry(e), (None, None))
+        self.assertEqual(bd.rights_state(e, TODAY),
+                         ("no_expiry", None))
+
+    def test_start_without_months_or_expires_is_unknown(self):
+        e = self.norm(usage_start="2026-09-01")
+        self.assertEqual(bd.usage_expiry(e), (None, None))
+        self.assertEqual(bd.rights_state(e, TODAY),
+                         ("no_expiry", None))
+
+    def test_version_is_0_2_0(self):
+        self.assertEqual(bd.__version__, "0.2.0")
+
+
+class TestUsageValidation(BoardCase):
+    def test_unparseable_usage_date_names_entry_and_field(self):
+        raw = entry(id=2)
+        raw["usage_expires"] = "not-a-date"
+        self.write_board([entry(id=1), raw])
+        r = self.cli("rights", "--as-of", TODAY_S)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("entry 2", r.stdout)
+        self.assertIn("usage_expires", r.stdout)
+        self.assertNotIn("Traceback", r.stdout + r.stderr)
+
+    def test_impossible_usage_date_is_clean_error(self):
+        raw = entry()
+        raw["usage_start"] = "2026-02-30"
+        self.write_board([raw])
+        r = self.cli("list")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("usage_start", r.stdout)
+        self.assertIn("not a real calendar date", r.stdout)
+
+    def test_months_without_start_rejected(self):
+        raw = entry()
+        raw["usage_months"] = 6
+        self.write_board([raw])
+        r = self.cli("rights", "--as-of", TODAY_S)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("usage_months", r.stdout)
+        self.assertIn("usage_start", r.stdout)
+
+    def test_bad_months_values_rejected(self):
+        for bad in (0, -3, 2.5, True, "6"):
+            raw = entry()
+            raw["usage_start"] = "2026-09-01"
+            raw["usage_months"] = bad
+            self.write_board([raw])
+            r = self.cli("list")
+            self.assertEqual(r.returncode, 2, bad)
+            self.assertIn("usage_months", r.stdout, bad)
+
+    def test_expires_before_start_rejected(self):
+        raw = entry()
+        raw["usage_start"] = "2026-09-01"
+        raw["usage_expires"] = "2026-08-01"
+        self.write_board([raw])
+        r = self.cli("list")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("before", r.stdout)
+
+
+class TestRightsCli(BoardCase):
+    def write_rights_board(self):
+        self.write_board([
+            entry(id=1, brand="Alpha", fee=100.10, status="paid",
+                  invoiced="2026-08-01",
+                  usage_expires="2026-10-01"),
+            entry(id=2, brand="Alpha", fee=200.20, status="invoiced",
+                  invoiced="2026-10-01",
+                  usage_expires="2026-11-20"),
+            entry(id=3, brand="Beta", fee=300.00, status="delivered",
+                  usage_start="2026-06-15", usage_months=12),
+            entry(id=4, brand="Beta", fee=50.25, status="agreed",
+                  due="2026-12-01"),
+        ])
+
+    def test_buckets_and_totals_to_the_cent(self):
+        self.write_rights_board()
+        r = self.cli("rights", "--as-of", TODAY_S, "--json")
+        self.assertEqual(r.returncode, 1)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["command"], "rights")
+        self.assertEqual(data["as_of"], TODAY_S)
+        self.assertEqual([e["id"] for e in data["expired"]], [1])
+        self.assertEqual([e["id"] for e in data["expiring"]], [2])
+        self.assertEqual([e["id"] for e in data["active"]], [3])
+        self.assertEqual([e["id"] for e in data["no_expiry"]], [4])
+        t = data["rights_totals"]
+        self.assertEqual(t["expired"], {"count": 1, "amount": 100.1})
+        self.assertEqual(t["expiring"], {"count": 1,
+                                         "amount": 200.2})
+        self.assertEqual(t["active"], {"count": 1, "amount": 300.0})
+        self.assertEqual(t["no_expiry"], {"count": 1,
+                                          "amount": 50.25})
+        # 100.10 + 200.20 = 300.30, all of it with one brand
+        self.assertEqual(t["renewal_at_stake"], 300.3)
+        self.assertEqual(t["by_brand_at_stake"], {"Alpha": 300.3})
+        self.assertEqual(data["action_items"], 2)
+        # hand day counts: 2026-10-01 is 34 days before as-of,
+        # 2026-11-20 is 16 after, 2027-06-15 is 223 after
+        self.assertEqual(data["expired"][0]["days_left"], -34)
+        self.assertEqual(data["expiring"][0]["days_left"], 16)
+        self.assertEqual(data["active"][0]["days_left"], 223)
+        self.assertEqual(data["expired"][0]["expiry_source"],
+                         "recorded")
+        self.assertEqual(data["active"][0]["expiry_source"],
+                         "computed")
+        self.assertEqual(data["active"][0]["usage_expiry"],
+                         "2027-06-15")
+        self.assertIsNone(data["no_expiry"][0]["usage_expiry"])
+        self.assertIsNone(data["no_expiry"][0]["days_left"])
+
+    def test_text_and_json_agree(self):
+        self.write_rights_board()
+        text = self.cli("rights", "--as-of", TODAY_S)
+        js = self.cli("rights", "--as-of", TODAY_S, "--json")
+        self.assertEqual(text.returncode, 1)
+        self.assertEqual(text.returncode, js.returncode)
+        data = json.loads(js.stdout)
+        self.assertIn("USAGE RIGHTS EXPIRED", text.stdout)
+        self.assertIn("NO EXPIRY RECORDED", text.stdout)
+        self.assertIn("$300.30", text.stdout)  # renewal at stake
+        self.assertIn("By brand (expired + expiring): Alpha "
+                      "$300.30", text.stdout)
+        self.assertIn(data["expired"][0]["message"], text.stdout)
+        self.assertEqual(data["expired"][0]["message"],
+                         bd.rights_message(
+                             bd.normalize_entry(
+                                 entry(status="paid",
+                                       invoiced="2026-08-01",
+                                       fee=100.10, brand="Alpha",
+                                       usage_expires="2026-10-01"),
+                                 1), TODAY))
+
+    def test_quiet_board_exits_0(self):
+        self.write_board([
+            entry(id=1, usage_expires="2027-06-01"),  # active
+            entry(id=2),                              # no expiry
+        ])
+        r = self.cli("rights", "--as-of", TODAY_S)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("Action items: 0", r.stdout)
+        self.assertIn("ACTIVE", r.stdout)
+        self.assertIn("NO EXPIRY RECORDED", r.stdout)
+
+    def test_expiry_today_is_expiring_and_exits_1(self):
+        self.write_board([entry(usage_expires=TODAY_S)])
+        r = self.cli("rights", "--as-of", TODAY_S)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("usage expires today, 2026-11-04 "
+                      "(recorded)", r.stdout)
+
+    def test_day_30_exits_1_day_31_exits_0(self):
+        self.write_board([entry(usage_expires="2026-12-04")])
+        self.assertEqual(self.cli("rights", "--as-of", TODAY_S)
+                         .returncode, 1)
+        self.write_board([entry(usage_expires="2026-12-05")])
+        self.assertEqual(self.cli("rights", "--as-of", TODAY_S)
+                         .returncode, 0)
+
+    def test_empty_board_exits_0(self):
+        self.write_board([])
+        r = self.cli("rights", "--as-of", TODAY_S)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("No deals on this board yet", r.stdout)
+
+    def test_today_alias_accepted(self):
+        self.write_board([entry(usage_expires="2026-11-20")])
+        r = self.cli("rights", "--today", TODAY_S)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("as of 2026-11-04", r.stdout)
+
+    def test_bad_as_of_is_clean_error(self):
+        self.write_board([entry()])
+        r = self.cli("rights", "--as-of", "next week")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--as-of", r.stdout)
+        r = self.cli("rights", "--as-of", "next week", "--json")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("error", json.loads(r.stdout))
+
+    def test_cad_to_inr(self):
+        self.write_board([entry(fee=1000.0,
+                                usage_expires="2026-10-01")])
+        r = self.cli("rights", "--as-of", TODAY_S,
+                     "--cad-to-inr", "67.97", "--json")
+        data = json.loads(r.stdout)
+        # 1000 * 67.97 = 67,970
+        self.assertEqual(data["expired"][0]["fee_inr"], 67970.0)
+        self.assertEqual(data["rights_totals"]["expired"]
+                         ["amount_inr"], 67970.0)
+        self.assertEqual(data["rights_totals"]
+                         ["renewal_at_stake_inr"], 67970.0)
+
+
+class TestRightsMessages(unittest.TestCase):
+    def test_expired_message_facts_and_no_price(self):
+        e = bd.normalize_entry(entry(
+            brand="Harbour Lights Hotels", contact="Alex Romero",
+            deliverable="Weekend getaway feature", fee=2000.0,
+            status="delivered", usage_expires="2026-11-01"), 1)
+        msg = bd.rights_message(e, TODAY)
+        for fact in ("Alex Romero", "Harbour Lights Hotels",
+                     "Weekend getaway feature", "2026-11-01",
+                     "3 days ago", "renewal"):
+            self.assertIn(fact, msg)
+        # a renewal line never names a price — the board records
+        # the original fee, not a renewal fee
+        for bad in ("$", "{", "}", "TODO", "net-30", "late fee",
+                    "final notice", "urgent", "Urgent"):
+            self.assertNotIn(bad, msg)
+
+    def test_expiring_message_facts(self):
+        e = bd.normalize_entry(entry(
+            brand="Summit Outdoor Co", contact="Casey Lin",
+            deliverable="Winter gear roundup", fee=1750.0,
+            status="invoiced", invoiced="2026-09-28",
+            usage_expires="2026-11-20"), 1)
+        msg = bd.rights_message(e, TODAY)
+        self.assertIn("runs until 2026-11-20 — 16 days from now",
+                      msg)
+        self.assertIn("Casey Lin", msg)
+        self.assertNotIn("$", msg)
+
+
+class TestSampleRights(BoardCase):
+    SAMPLE = EXAMPLES / "sample-board.json"
+
+    def test_sample_rights_buckets_and_totals(self):
+        r = run_cli("rights", "--board", str(self.SAMPLE),
+                    "--as-of", TODAY_S, "--json")
+        self.assertEqual(r.returncode, 1)
+        data = json.loads(r.stdout)
+        # hand-derived buckets (see this file's header note)
+        self.assertEqual([e["id"] for e in data["expired"]], [5])
+        self.assertEqual([e["id"] for e in data["expiring"]], [7])
+        self.assertEqual([e["id"] for e in data["active"]], [6])
+        self.assertEqual([e["id"] for e in data["no_expiry"]],
+                         [1, 2, 3, 4, 8, 9])
+        t = data["rights_totals"]
+        self.assertEqual(t["expired"]["amount"], 2000.0)
+        self.assertEqual(t["expiring"]["amount"], 1750.0)
+        self.assertEqual(t["active"]["amount"], 1100.0)
+        self.assertEqual(t["no_expiry"]["amount"], 5800.0)
+        self.assertEqual(t["renewal_at_stake"], 3750.0)
+        self.assertEqual(t["by_brand_at_stake"],
+                         {"Harbour Lights Hotels": 2000.0,
+                          "Summit Outdoor Co": 1750.0})
+        self.assertEqual(data["expired"][0]["days_left"], -3)
+        self.assertEqual(data["expired"][0]["usage_expiry"],
+                         "2026-11-01")
+        self.assertEqual(data["expired"][0]["expiry_source"],
+                         "computed")
+        self.assertEqual(data["expiring"][0]["days_left"], 16)
+        self.assertEqual(data["expiring"][0]["expiry_source"],
+                         "recorded")
+        self.assertEqual(data["active"][0]["days_left"], 342)
+        # the v0.1.0 money story is untouched by the fold
+        self.assertEqual(data["totals"]["delivered_unpaid"], 4850.0)
+        self.assertEqual(data["totals"]["paid"], 650.0)
+
+
+class TestAddUsage(BoardCase):
+    def test_add_records_usage_fields(self):
+        r = run_cli("add", "--board", str(self.board),
+                    "--brand", "A Co", "--deliverable", "Reel",
+                    "--fee", "500", "--status", "delivered",
+                    "--usage-start", "2026-08-01",
+                    "--usage-months", "3")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("usage expires 2026-11-01 (computed)",
+                      r.stdout)
+        saved = json.loads(self.board.read_text())["deals"][0]
+        self.assertEqual(saved["usage_start"], "2026-08-01")
+        self.assertEqual(saved["usage_months"], 3)
+        self.assertIsNone(saved["usage_expires"])
+        r = run_cli("rights", "--board", str(self.board),
+                    "--as-of", TODAY_S, "--json")
+        data = json.loads(r.stdout)
+        self.assertEqual([e["id"] for e in data["expired"]], [1])
+
+    def test_add_recorded_expiry(self):
+        r = run_cli("add", "--board", str(self.board),
+                    "--brand", "A Co", "--deliverable", "Reel",
+                    "--fee", "500", "--usage-expires", "2027-01-31")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("usage expires 2027-01-31 (recorded)",
+                      r.stdout)
+
+    def test_add_months_without_start_rejected(self):
+        r = run_cli("add", "--board", str(self.board),
+                    "--brand", "A Co", "--deliverable", "Reel",
+                    "--fee", "500", "--usage-months", "6")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--usage-start", r.stdout)
+        self.assertFalse(self.board.exists())
+
+    def test_add_bad_usage_values_rejected(self):
+        r = run_cli("add", "--board", str(self.board),
+                    "--brand", "A Co", "--deliverable", "Reel",
+                    "--fee", "500", "--usage-expires", "2026-02-30")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("not a real calendar date", r.stdout)
+        r = run_cli("add", "--board", str(self.board),
+                    "--brand", "A Co", "--deliverable", "Reel",
+                    "--fee", "500", "--usage-start", "2026-09-01",
+                    "--usage-months", "0")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--usage-months", r.stdout)
+        self.assertFalse(self.board.exists())
 
 
 if __name__ == "__main__":

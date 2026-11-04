@@ -1,5 +1,60 @@
 # Changelog
 
+## v0.2.0 — 2026-11-04
+
+The Usage-Rights Expiry fold: the board now tracks the usage
+window each deal grants the brand, not just the money.
+
+- **New `rights` command — the usage-rights view.** Four
+  groups against an explicit `--as-of` date (the pack's
+  `--today` convention under the name the question is asked
+  with; `--today` is accepted as the same flag): **expired**
+  (window closed), **expiring within 30 days**, **active**,
+  and **no expiry recorded**. The expiry date is the **last
+  day** of the window — on that day the deal is expiring with
+  0 days left, and it turns expired the next day; day 30
+  counts as expiring, day 31 is active. Exits **1 when any
+  window is expired or closing**, so a reminder script can
+  act on it; 0 otherwise.
+- **Three optional board fields** — `usage_start`,
+  `usage_months`, `usage_expires` — validated like every
+  other field, with errors that name the entry and the field
+  (a `usage_months` with no `usage_start` to count from, and
+  an expiry before its start, are clean errors, never
+  tracebacks). A recorded `usage_expires` rules; with only a
+  start and a length, the end is computed (start + months,
+  the day clamped to the target month's length) and labelled
+  **computed** wherever it appears. `add` takes
+  `--usage-start` / `--usage-months` / `--usage-expires`.
+  Boards written by v0.1.0 load unchanged — old deals simply
+  have no window recorded.
+- **No expiry is ever invented.** Deals without usage fields
+  land in NO EXPIRY RECORDED — unknown, not unlimited — and
+  the tool never derives an expiry from the deliverable or
+  invoice date, which say nothing about usage.
+- **Renewal money, kept honest.** Per-group counts and
+  values, a per-brand roll-up, and one "renewal value at
+  stake" figure (expired + expiring). Expired and expiring
+  deals get a polite renewal line built only from board
+  facts (brand, contact, deliverable, dates) — it **never
+  names a renewal price**, because the board records the
+  original fee, not a renewal fee.
+- Sample board extended: the same nine deals with the same
+  v0.1.0 totals (delivered-but-unpaid still $4,850 against
+  $650 paid) — three deals now carry usage terms, one in
+  each dated group (expired $2,000 · expiring $1,750 ·
+  active $1,100), and the other six sit in NO EXPIRY
+  RECORDED ($5,800), so renewal value at stake is $3,750.
+- 77 tests (28 new): hand-computed window boundaries
+  (expiry day itself, day 30 in / day 31 active), month
+  clamping including leap years, recorded-over-computed
+  precedence, corrupt usage-field errors, `add`-flag
+  validation, renewal-line fact checks (including a ban on
+  naming a price), text/JSON agreement, and the sample
+  board's hand-derived buckets. Zero v0.1.0 regressions —
+  the `due` view's output is unchanged apart from the
+  version banner.
+
 ## v0.1.0 — 2026-11-04
 
 First release.

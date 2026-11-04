@@ -29,6 +29,13 @@ Entry fields:
   due         deliverable due date, YYYY-MM-DD (or null)
   invoiced    invoice date, YYYY-MM-DD (or null; required once a
               deal is invoiced or paid)
+  usage_start   the day the brand's usage window opened,
+              YYYY-MM-DD (or null)
+  usage_months  the length of that window in whole months, >= 1
+              (or null; needs usage_start to count from)
+  usage_expires the last day of the usage window, YYYY-MM-DD
+              (or null) — when recorded it rules; otherwise the
+              end is computed as usage_start + usage_months
 
 Commands:
   add       --brand B --deliverable D --fee F [--contact C]
@@ -52,6 +59,21 @@ Commands:
             line built ONLY from facts on the board — brand,
             contact, deliverable, fee and the real dates. No fake
             urgency, no invented payment terms.
+  rights    [--as-of D] — the usage-rights view: which deals'
+            granted usage windows have EXPIRED, which EXPIRE
+            WITHIN 30 DAYS, which are still ACTIVE, and which
+            have NO EXPIRY RECORDED (unknown — never guessed,
+            and never derived from the due or invoice date). The
+            expiry date is the last day of the window: on that
+            day the deal is expiring, not yet expired. A recorded
+            usage_expires rules; with only usage_start +
+            usage_months the end is computed (start + months,
+            day clamped to the target month's length) and
+            labelled computed wherever it appears. Expired and
+            expiring deals get a polite renewal line built only
+            from board facts — it never names a renewal price,
+            because the board records the original fee, not a
+            renewal fee.
 
 Totals are shown everywhere: pipeline value by status, money
 delivered-but-unpaid (delivered + invoiced), and money paid. An
@@ -61,11 +83,11 @@ Fees are CAD. --cad-to-inr R also prints INR equivalents (rate R
 per 1 CAD), following the CAD + INR display pattern of
 payout-tracker.
 
-Exit codes: 0 = ok / nothing due · 1 = `due` found at least one
-action item (a finding, so a reminder script can act on it) ·
-2 = ERROR — clean message, never a traceback; with --json the
-error is {"error": ...}. A corrupt board is an error and is NEVER
-overwritten or silently wiped.
+Exit codes: 0 = ok / nothing due · 1 = `due` or `rights` found at
+least one action item (a finding, so a reminder script can act
+on it) · 2 = ERROR — clean message, never a traceback; with
+--json the error is {"error": ...}. A corrupt board is an error
+and is NEVER overwritten or silently wiped.
 """
 import argparse
 import json
@@ -76,7 +98,7 @@ import sys
 from datetime import date
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 TOOL = "brand-deal-pipeline"
 
 STATUSES = ("pitched", "negotiating", "agreed", "delivered",
@@ -94,6 +116,7 @@ TRANSITIONS = {
 DUE_WINDOW_DAYS = 7        # deliverable due within this = due soon
 CHASE_DAYS = 14            # unpaid invoice this old = chase it
 OVERDUE_DAYS = 30          # unpaid invoice this old = overdue
+RIGHTS_EXPIRING_DAYS = 30  # usage window closing within this = expiring
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -121,6 +144,15 @@ def today_arg(value):
     if value is None:
         return date.today()
     return parse_date(value, "--today")
+
+
+def as_of_arg(value):
+    """Resolve the rights view's --as-of flag to a date — the same
+    convention as --today (an explicit pin, else the real today),
+    under the name the question is actually asked with."""
+    if value is None:
+        return date.today()
+    return parse_date(value, "--as-of")
 
 
 # --------------------------------------------------------------------------
@@ -187,6 +219,27 @@ def normalize_entry(raw, no):
         _fail_entry(no, f"status is '{status}' but there is no "
                         f"'invoiced' date — an invoiced deal needs "
                         f"the date its invoice went out")
+    usage_start = _opt_date(raw, "usage_start", no)
+    usage_expires = _opt_date(raw, "usage_expires", no)
+    usage_months = raw.get("usage_months")
+    if usage_months is not None:
+        if isinstance(usage_months, bool) \
+                or not isinstance(usage_months, int) \
+                or usage_months < 1:
+            _fail_entry(no, f"'usage_months' must be a positive "
+                            f"whole number of months "
+                            f"(got {usage_months!r})")
+        if usage_start is None:
+            _fail_entry(no, "'usage_months' needs a 'usage_start' "
+                            "to count from — record the day the "
+                            "usage window opened, or record "
+                            "'usage_expires' directly")
+    if usage_start is not None and usage_expires is not None \
+            and usage_expires < usage_start:
+        _fail_entry(no, f"'usage_expires' ({usage_expires}) is "
+                        f"before 'usage_start' ({usage_start}) — "
+                        f"a usage window cannot end before it "
+                        f"starts")
     return {
         "id": entry_id,
         "brand": brand.strip(),
@@ -196,6 +249,9 @@ def normalize_entry(raw, no):
         "status": status,
         "due": due,
         "invoiced": invoiced,
+        "usage_start": usage_start,
+        "usage_months": usage_months,
+        "usage_expires": usage_expires,
     }
 
 
@@ -302,6 +358,144 @@ def invoice_state(entry, today):
     if age >= CHASE_DAYS:
         return ("chase", age)
     return None
+
+
+# --------------------------------------------------------------------------
+# usage rights — when the brand's window over the content closes
+# --------------------------------------------------------------------------
+
+def _add_months(day, months):
+    """`day` plus whole calendar months, the day clamped to the
+    target month's length: 2026-01-31 + 1 month -> 2026-02-28,
+    never a spill into March."""
+    total = day.year * 12 + (day.month - 1) + months
+    year, month0 = divmod(total, 12)
+    month = month0 + 1
+    first = date(year, month, 1)
+    nxt = date(year + 1, 1, 1) if month == 12 \
+        else date(year, month + 1, 1)
+    last_day = (nxt - first).days
+    return date(year, month, min(day.day, last_day))
+
+
+def usage_expiry(entry):
+    """The effective last day of the brand's usage window ->
+    (date, source). A recorded usage_expires rules ("recorded");
+    otherwise usage_start + usage_months gives the end
+    ("computed") and that date is the last day of the window.
+    With neither, (None, None): the expiry is unknown. It is
+    never guessed — least of all from the due or invoice date,
+    which say nothing about usage."""
+    if entry["usage_expires"] is not None:
+        return date.fromisoformat(entry["usage_expires"]), "recorded"
+    if entry["usage_start"] is not None \
+            and entry["usage_months"] is not None:
+        start = date.fromisoformat(entry["usage_start"])
+        return _add_months(start, entry["usage_months"]), "computed"
+    return None, None
+
+
+def rights_state(entry, as_of):
+    """(state, days_left) for a deal's usage window against the
+    as-of date. The expiry date is the LAST day of the window, so
+    on the expiry day itself the deal is "expiring" with 0 days
+    left — it turns "expired" the day after. "expiring" runs to
+    exactly 30 days out (day 30 in, day 31 is "active"). No
+    expiry on record -> ("no_expiry", None)."""
+    expiry, _source = usage_expiry(entry)
+    if expiry is None:
+        return ("no_expiry", None)
+    days_left = (expiry - as_of).days
+    if days_left < 0:
+        return ("expired", days_left)
+    if days_left <= RIGHTS_EXPIRING_DAYS:
+        return ("expiring", days_left)
+    return ("active", days_left)
+
+
+def rights_message(entry, as_of):
+    """A polite renewal line for an expired or expiring usage
+    window, built ONLY from facts on the board: brand, contact,
+    deliverable and the real expiry date. It never names a price
+    — the board records the deal's original fee, not a renewal
+    fee, and quoting it as one would be inventing terms."""
+    state, days_left = rights_state(entry, as_of)
+    expiry, _source = usage_expiry(entry)
+    when = expiry.isoformat()
+    if state == "expired":
+        return (f"{_greeting(entry)}, a note on the "
+                f"{entry['deliverable']} for {entry['brand']}: "
+                f"the usage window on our deal closed on {when} "
+                f"— {_days(-days_left)} ago. If the content is "
+                f"still in use on your side, I'd like to agree a "
+                f"renewal covering the time since then; if it has "
+                f"been retired, no action is needed. Happy to "
+                f"talk it through either way.")
+    if days_left == 0:
+        return (f"{_greeting(entry)}, a note on the "
+                f"{entry['deliverable']} for {entry['brand']}: "
+                f"the usage window on our deal runs until today, "
+                f"{when}. If you'd like to keep using the content "
+                f"past today, I'm glad to agree an extension "
+                f"before the window lapses.")
+    return (f"{_greeting(entry)}, a note on the "
+            f"{entry['deliverable']} for {entry['brand']}: the "
+            f"usage window on our deal runs until {when} — "
+            f"{_days(days_left)} from now. If you'd like to keep "
+            f"using the content past that date, I'm glad to "
+            f"agree an extension before the window lapses.")
+
+
+def annotate_rights(entry, as_of):
+    """An entry plus its usage-window view fields for `as_of`."""
+    view = annotate(entry, as_of)
+    expiry, source = usage_expiry(entry)
+    state, days_left = rights_state(entry, as_of)
+    view["usage_expiry"] = expiry.isoformat() if expiry else None
+    view["expiry_source"] = source
+    view["state"] = state
+    view["days_left"] = days_left
+    if state in ("expired", "expiring"):
+        view["message"] = rights_message(entry, as_of)
+    return view
+
+
+def build_rights(entries, as_of):
+    """The usage-rights view for `as_of`: four buckets, per-bucket
+    totals, the per-brand roll-up, and the renewal value at
+    stake. Expired lists most-overdue first; expiring and active
+    list soonest expiry first; no-expiry lists by id."""
+    buckets = {"expired": [], "expiring": [], "active": [],
+               "no_expiry": []}
+    for e in entries:
+        buckets[rights_state(e, as_of)[0]].append(
+            annotate_rights(e, as_of))
+    for name in ("expired", "expiring", "active"):
+        buckets[name].sort(key=lambda e: (e["days_left"], e["id"]))
+    buckets["no_expiry"].sort(key=lambda e: e["id"])
+    totals = {name: {"count": len(group),
+                     "amount": sum(e["fee"] for e in group)}
+              for name, group in buckets.items()}
+    by_brand = {}
+    for name in ("expired", "expiring"):
+        for e in buckets[name]:
+            by_brand[e["brand"]] = by_brand.get(e["brand"], 0.0) \
+                + e["fee"]
+    return {
+        "expired": buckets["expired"],
+        "expiring": buckets["expiring"],
+        "active": buckets["active"],
+        "no_expiry": buckets["no_expiry"],
+        "rights_totals": totals,
+        "renewal_at_stake": (totals["expired"]["amount"]
+                             + totals["expiring"]["amount"]),
+        "by_brand_at_stake": by_brand,
+    }
+
+
+def rights_action_count(rights_view):
+    return (len(rights_view["expired"])
+            + len(rights_view["expiring"]))
 
 
 def _greeting(entry):
@@ -478,6 +672,9 @@ def _entry_json(e, cad_to_inr, with_view=True):
         "status": e["status"],
         "due": e["due"],
         "invoiced": e["invoiced"],
+        "usage_start": e["usage_start"],
+        "usage_months": e["usage_months"],
+        "usage_expires": e["usage_expires"],
     }
     if with_view:
         for field in ("days_until_due", "invoice_age_days", "state",
@@ -637,6 +834,158 @@ def list_as_json(annotated, totals, board_name, today, cad_to_inr):
     }
 
 
+def _rights_entry_json(e, cad_to_inr):
+    obj = _entry_json(e, cad_to_inr)
+    obj["usage_expiry"] = e["usage_expiry"]
+    obj["expiry_source"] = e["expiry_source"]
+    obj["days_left"] = e["days_left"]
+    return obj
+
+
+def _rights_totals_json(rights_view, cad_to_inr):
+    obj = {}
+    for name in ("expired", "expiring", "active", "no_expiry"):
+        t = {"count": rights_view["rights_totals"][name]["count"],
+             "amount": round(
+                 rights_view["rights_totals"][name]["amount"], 2)}
+        obj[name] = _with_inr(t, ("amount",), cad_to_inr)
+    obj["renewal_at_stake"] = round(rights_view["renewal_at_stake"],
+                                    2)
+    obj["by_brand_at_stake"] = {
+        brand: round(amount, 2) for brand, amount
+        in sorted(rights_view["by_brand_at_stake"].items())}
+    obj = _with_inr(obj, ("renewal_at_stake",), cad_to_inr)
+    if cad_to_inr is not None:
+        obj["by_brand_at_stake_inr"] = {
+            brand: round(amount * cad_to_inr, 2) for brand, amount
+            in sorted(rights_view["by_brand_at_stake"].items())}
+    return obj
+
+
+def _rights_totals_lines(rights_view, cad_to_inr):
+    t = rights_view["rights_totals"]
+    parts = []
+    for name, label in (("expired", "expired"),
+                        ("expiring", "expiring"),
+                        ("active", "active"),
+                        ("no_expiry", "no expiry recorded")):
+        b = t[name]
+        parts.append(f"{label} "
+                     f"{_fmt_money(b['amount'], cad_to_inr)} "
+                     f"({b['count']})")
+    lines = [
+        "RIGHTS TOTALS: " + " · ".join(parts),
+        f"Renewal value at stake (expired + expiring): "
+        f"{_fmt_money(rights_view['renewal_at_stake'], cad_to_inr)}",
+    ]
+    by_brand = rights_view["by_brand_at_stake"]
+    if by_brand:
+        parts = [f"{brand} {_fmt_money(amount, cad_to_inr)}"
+                 for brand, amount in sorted(by_brand.items())]
+        lines.append("By brand (expired + expiring): "
+                     + " · ".join(parts))
+    return lines
+
+
+def _rights_line(e, cad_to_inr=None):
+    line = _entry_line(e, cad_to_inr)
+    if e["state"] == "no_expiry":
+        return line + " — no usage expiry recorded"
+    if e["expiry_source"] == "recorded":
+        src = "recorded"
+    else:
+        src = (f"from {e['usage_start']} + {e['usage_months']} "
+               f"months")
+    if e["state"] == "expired":
+        note = (f"usage expired {e['usage_expiry']} "
+                f"({_days(-e['days_left'])} ago; {src})")
+    elif e["days_left"] == 0:
+        note = f"usage expires today, {e['usage_expiry']} ({src})"
+    else:
+        note = (f"usage expires {e['usage_expiry']} "
+                f"(in {_days(e['days_left'])}; {src})")
+    return line + " — " + note
+
+
+def render_rights_text(rights_view, totals, board_name, as_of,
+                       cad_to_inr):
+    lines = [
+        f"brand-deal-pipeline v{__version__} — rights · board "
+        f"{board_name} · as of {as_of.isoformat()}",
+        "Amounts in CAD."
+        + (f" INR equivalents at {cad_to_inr:g} per CAD dollar."
+           if cad_to_inr is not None else ""),
+        "",
+    ]
+    if not any(rights_view[name] for name in
+               ("expired", "expiring", "active", "no_expiry")):
+        lines.append("No deals on this board yet — add one with "
+                     "`add`.")
+        lines.append("")
+    group = rights_view["expired"]
+    if group:
+        lines.append(f"USAGE RIGHTS EXPIRED — the window has "
+                     f"closed; content still in use past it is "
+                     f"unpaid use ({len(group)}):")
+        for e in group:
+            lines.append(_rights_line(e, cad_to_inr))
+            lines.append(f"   → {e['message']}")
+        lines.append("")
+    group = rights_view["expiring"]
+    if group:
+        lines.append(f"EXPIRING WITHIN {RIGHTS_EXPIRING_DAYS} "
+                     f"DAYS — time to open the renewal "
+                     f"conversation ({len(group)}):")
+        for e in group:
+            lines.append(_rights_line(e, cad_to_inr))
+            lines.append(f"   → {e['message']}")
+        lines.append("")
+    group = rights_view["active"]
+    if group:
+        lines.append(f"ACTIVE — window open beyond "
+                     f"{RIGHTS_EXPIRING_DAYS} days "
+                     f"({len(group)}):")
+        for e in group:
+            lines.append(_rights_line(e, cad_to_inr))
+        lines.append("")
+    group = rights_view["no_expiry"]
+    if group:
+        lines.append(f"NO EXPIRY RECORDED — the board does not "
+                     f"say when usage ends; that is unknown, not "
+                     f"unlimited ({len(group)}):")
+        for e in group:
+            lines.append(_rights_line(e, cad_to_inr))
+        lines.append("")
+    lines.extend(_rights_totals_lines(rights_view, cad_to_inr))
+    lines.extend(_totals_lines(totals, cad_to_inr))
+    lines.append(f"Action items: "
+                 f"{rights_action_count(rights_view)} (usage "
+                 f"expired or expiring within "
+                 f"{RIGHTS_EXPIRING_DAYS} days)")
+    return "\n".join(lines)
+
+
+def rights_as_json(rights_view, totals, board_name, as_of,
+                   cad_to_inr):
+    return {
+        "tool": TOOL, "version": __version__, "command": "rights",
+        "board": board_name, "as_of": as_of.isoformat(),
+        "cad_to_inr": cad_to_inr,
+        "expired": [_rights_entry_json(e, cad_to_inr)
+                    for e in rights_view["expired"]],
+        "expiring": [_rights_entry_json(e, cad_to_inr)
+                     for e in rights_view["expiring"]],
+        "active": [_rights_entry_json(e, cad_to_inr)
+                   for e in rights_view["active"]],
+        "no_expiry": [_rights_entry_json(e, cad_to_inr)
+                      for e in rights_view["no_expiry"]],
+        "action_items": rights_action_count(rights_view),
+        "rights_totals": _rights_totals_json(rights_view,
+                                             cad_to_inr),
+        "totals": _totals_json(totals, cad_to_inr),
+    }
+
+
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
@@ -706,6 +1055,26 @@ def cmd_add(a):
                 if a.invoiced else None)
     if a.status in ("invoiced", "paid") and invoiced is None:
         invoiced = today.isoformat()
+    usage_start = (parse_date(a.usage_start, "--usage-start")
+                   .isoformat() if a.usage_start else None)
+    usage_expires = (parse_date(a.usage_expires, "--usage-expires")
+                     .isoformat() if a.usage_expires else None)
+    usage_months = a.usage_months
+    if usage_months is not None:
+        if usage_months < 1:
+            raise ToolError(f"--usage-months must be a positive "
+                            f"whole number of months "
+                            f"(got {usage_months})")
+        if usage_start is None:
+            raise ToolError("--usage-months needs --usage-start "
+                            "to count from — or pass "
+                            "--usage-expires directly")
+    if usage_start is not None and usage_expires is not None \
+            and usage_expires < usage_start:
+        raise ToolError(f"--usage-expires ({usage_expires}) is "
+                        f"before --usage-start ({usage_start}) — "
+                        f"a usage window cannot end before it "
+                        f"starts")
     entry = {
         "id": max((e["id"] for e in entries), default=0) + 1,
         "brand": brand,
@@ -715,6 +1084,9 @@ def cmd_add(a):
         "status": a.status,
         "due": due,
         "invoiced": invoiced,
+        "usage_start": usage_start,
+        "usage_months": usage_months,
+        "usage_expires": usage_expires,
     }
     entries.append(entry)
     save_board(path, entries)
@@ -727,12 +1099,21 @@ def cmd_add(a):
             "deal": _entry_json(view, cad_to_inr),
         }, indent=2))
     else:
+        expiry, source = usage_expiry(entry)
+        usage_note = ""
+        if expiry is not None:
+            usage_note = f", usage expires {expiry.isoformat()} " \
+                         f"({source})"
+        elif usage_start is not None:
+            usage_note = f", usage from {usage_start} " \
+                         f"(no expiry recorded)"
         print(f"Added deal #{entry['id']}: {entry['brand']} — "
               f"{entry['deliverable']} — "
               f"{_fmt_money(fee, cad_to_inr)} "
               f"(status {entry['status']}"
               + (f", deliverable due {due}" if due else "")
               + (f", invoiced {invoiced}" if invoiced else "")
+              + usage_note
               + ")")
         print(f"Board: {path.name} ({len(entries)} deal(s))")
     return 0
@@ -768,6 +1149,23 @@ def cmd_due(a):
         print(render_due_text(due_view, totals, path.name, today,
                               cad_to_inr))
     return 1 if action_count(due_view) else 0
+
+
+def cmd_rights(a):
+    cad_to_inr = _cad_to_inr(a)
+    path = Path(a.board)
+    entries = load_board(path)
+    as_of = as_of_arg(a.as_of)
+    rights_view = build_rights(entries, as_of)
+    totals = compute_totals(entries)
+    if a.json:
+        print(json.dumps(rights_as_json(rights_view, totals,
+                                        path.name, as_of,
+                                        cad_to_inr), indent=2))
+    else:
+        print(render_rights_text(rights_view, totals, path.name,
+                                 as_of, cad_to_inr))
+    return 1 if rights_action_count(rights_view) else 0
 
 
 def cmd_move(a):
@@ -850,6 +1248,16 @@ def main(argv=None):
                             "information once a deal is invoiced or "
                             "paid; defaults to today for those "
                             "statuses)")
+    p_add.add_argument("--usage-start", default=None,
+                       help="date the brand's usage window opened, "
+                            "YYYY-MM-DD")
+    p_add.add_argument("--usage-months", type=int, default=None,
+                       help="length of the usage window in whole "
+                            "months, counted from --usage-start")
+    p_add.add_argument("--usage-expires", default=None,
+                       help="last day of the usage window, "
+                            "YYYY-MM-DD (rules over --usage-start + "
+                            "--usage-months when both are given)")
     _today_arg(p_add)
     _board_arg(p_add)
     _json_arg(p_add)
@@ -875,6 +1283,23 @@ def main(argv=None):
     _json_arg(p_due)
     _inr_arg(p_due)
     p_due.set_defaults(func=cmd_due)
+
+    p_rights = sub.add_parser(
+        "rights", help="the usage-rights view: which deals' "
+                       "usage windows have expired, expire within "
+                       "30 days, are still active, or have no "
+                       "expiry recorded; exit 1 when a window is "
+                       "expired or closing")
+    p_rights.add_argument("--as-of", "--today", dest="as_of",
+                          default=None,
+                          help="date to judge the windows "
+                               "against, YYYY-MM-DD (--today is "
+                               "accepted as the same flag; "
+                               "default: today)")
+    _board_arg(p_rights)
+    _json_arg(p_rights)
+    _inr_arg(p_rights)
+    p_rights.set_defaults(func=cmd_rights)
 
     p_move = sub.add_parser(
         "move", help="move a deal to a new pipeline status "

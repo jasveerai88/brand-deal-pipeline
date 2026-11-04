@@ -12,7 +12,7 @@ Agency CRMs fix it for teams: monthly subscriptions, pipeline
 boards and fields built for account managers, not for one
 creator with nine deals.
 
-`brand-deal-pipeline` is one JSON board file and four commands.
+`brand-deal-pipeline` is one JSON board file and five commands.
 It walks every deal from **pitched** to **paid**, and its `due`
 view is the morning checklist: which deliverables are due or
 overdue, which delivered work was never invoiced, and which
@@ -20,6 +20,10 @@ invoices are aging — each with a polite, copy-ready line built
 only from the facts on the board. The totals stay honest:
 pipeline value by status, money delivered-but-unpaid, and money
 actually paid, kept in separate buckets where they belong.
+And because delivered content keeps working for the brand long
+after the invoice is paid, its `rights` view tracks the usage
+window each deal granted: which windows have closed, which are
+closing, and what renewal money is sitting on the table.
 
 - Pure Python 3 standard library — no dependencies, no install step
 - Local only — your deal list never leaves your machine
@@ -61,6 +65,39 @@ Boundaries are exact: a deliverable due in exactly 7 days is in
 the view, 8 days is not; an invoice at 14 days is a chase, at
 30 it is overdue.
 
+## The rights view
+
+A delivered video keeps earning for the brand after you've been
+paid — that is what usage rights are: the window during which
+the brand may keep using your content. When the window closes,
+continued use is a renewal conversation, and creators who track
+the dates get paid twice for the same work. The `rights` view
+is that tracker:
+
+| Group | Rule |
+|---|---|
+| USAGE RIGHTS EXPIRED | the window's last day is before the as-of date |
+| EXPIRING WITHIN 30 DAYS | the last day is the as-of date itself, up to 30 days out |
+| ACTIVE | the last day is 31+ days out |
+| NO EXPIRY RECORDED | the board records no window end — unknown, not unlimited |
+
+The expiry date is the **last day** of the window: on that day
+the deal is expiring (0 days left); it is expired from the next
+day. A deal records its window with any of `usage_start`,
+`usage_months` (counted from the start) and `usage_expires`.
+A recorded `usage_expires` rules; with only a start and a
+length, the end is computed — start + months, the day clamped
+to the target month's length (31 Jan + 1 month = 28 Feb) — and
+labelled *computed* wherever it appears. Deals with no usage
+fields land in NO EXPIRY RECORDED: the tool never derives an
+expiry from the deliverable or invoice date, because those
+dates say nothing about usage. Expired and expiring deals get
+a polite renewal line built from board facts — brand, contact,
+deliverable and the real dates — which never names a renewal
+price: the board records the original fee, not a renewal fee.
+`rights` exits 1 when any window is expired or closing within
+30 days, 0 otherwise.
+
 ## The board file
 
 One JSON file (default `deals.json`, created by your first
@@ -71,7 +108,7 @@ One JSON file (default `deals.json`, created by your first
   {"id": 7, "brand": "Summit Outdoor Co", "contact": "Casey Lin",
    "deliverable": "Winter gear roundup", "fee": 1750.0,
    "status": "invoiced", "due": "2026-09-20",
-   "invoiced": "2026-09-28"}
+   "invoiced": "2026-09-28", "usage_expires": "2026-11-20"}
 ]}
 ```
 
@@ -85,6 +122,9 @@ One JSON file (default `deals.json`, created by your first
 | `status` | one of the seven stages above |
 | `due` | deliverable due date, `YYYY-MM-DD`, or `null` |
 | `invoiced` | invoice date, or `null` (required once invoiced/paid) |
+| `usage_start` | day the brand's usage window opened, or `null` |
+| `usage_months` | window length in whole months (≥ 1) from `usage_start`, or `null` |
+| `usage_expires` | last day of the usage window, or `null` (rules over start + months) |
 
 You can edit the file by hand — it is validated on every read.
 A corrupt board is a clean error that names the problem entry,
@@ -145,12 +185,19 @@ python3 src/brand_deal_pipeline.py due \
 
 # 6. Drive a reminder: exit 1 means something needs action
 python3 src/brand_deal_pipeline.py due || echo "check the board"
+
+# 7. The rights view: which usage windows have closed or are
+#    closing — record terms with add --usage-start 2026-08-01
+#    --usage-months 3 (or --usage-expires 2026-11-20)
+python3 src/brand_deal_pipeline.py rights \
+    --board examples/sample-board.json --as-of 2026-11-04
 ```
 
 `--today YYYY-MM-DD` pretends today is that date — the bundled
 sample uses fixed dates, so its demos pass `--today 2026-11-04`
 to stay reproducible. Day to day you omit it and the real date
-is used.
+is used. `rights` takes `--as-of` for the same job, under the
+name the question is asked with (it also accepts `--today`).
 
 ## Use with AI agents
 
@@ -176,7 +223,7 @@ overdue and an invoice 37 days unpaid. Against
 
 ```text
 $ python3 src/brand_deal_pipeline.py due --board examples/sample-board.json --today 2026-11-04
-brand-deal-pipeline v0.1.0 — due · board sample-board.json · today 2026-11-04
+brand-deal-pipeline v0.2.0 — due · board sample-board.json · today 2026-11-04
 Amounts in CAD.
 
 DELIVERABLES DUE — agreed deals overdue or due within 7 days (2):
@@ -210,6 +257,51 @@ $1,750 of that has been sitting unpaid for 37 days. That gap
 between "deals on the board" and "paid" is exactly the gap
 this tool exists to close.
 
+The same board through the rights view, against the same
+fixed date:
+
+```text
+$ python3 src/brand_deal_pipeline.py rights --board examples/sample-board.json --as-of 2026-11-04
+brand-deal-pipeline v0.2.0 — rights · board sample-board.json · as of 2026-11-04
+Amounts in CAD.
+
+USAGE RIGHTS EXPIRED — the window has closed; content still in use past it is unpaid use (1):
+#5 · Harbour Lights Hotels (Alex Romero) — Weekend getaway feature — $2,000.00 — delivered — deliverable due 2026-10-25 — usage expired 2026-11-01 (3 days ago; from 2026-08-01 + 3 months)
+   → Hi Alex Romero, a note on the Weekend getaway feature for Harbour Lights Hotels: the usage window on our deal closed on 2026-11-01 — 3 days ago. If the content is still in use on your side, I'd like to agree a renewal covering the time since then; if it has been retired, no action is needed. Happy to talk it through either way.
+
+EXPIRING WITHIN 30 DAYS — time to open the renewal conversation (1):
+#7 · Summit Outdoor Co (Casey Lin) — Winter gear roundup — $1,750.00 — invoiced — deliverable due 2026-09-20 — invoiced 2026-09-28 — usage expires 2026-11-20 (in 16 days; recorded)
+   → Hi Casey Lin, a note on the Winter gear roundup for Summit Outdoor Co: the usage window on our deal runs until 2026-11-20 — 16 days from now. If you'd like to keep using the content past that date, I'm glad to agree an extension before the window lapses.
+
+ACTIVE — window open beyond 30 days (1):
+#6 · Pinecrest Supplements (Taylor Brooks) — Product review video — $1,100.00 — invoiced — deliverable due 2026-10-12 — invoiced 2026-10-20 — usage expires 2027-10-12 (in 342 days; from 2026-10-12 + 12 months)
+
+NO EXPIRY RECORDED — the board does not say when usage ends; that is unknown, not unlimited (6):
+#1 · Northwind Coffee (Maya Chen) — 60-second product reel — $750.00 — pitched — no usage expiry recorded
+#2 · Trailhead Gear (Jordan Blake) — Unboxing short + story set — $1,200.00 — negotiating — deliverable due 2026-11-20 — no usage expiry recorded
+#3 · Brightpath Tutoring (Priya Nair) — Sponsored tutorial video — $1,500.00 — agreed — deliverable due 2026-11-09 — no usage expiry recorded
+#4 · Kelowna Dental Studio (Dr. Sam Whitaker) — Clinic tour reel — $900.00 — agreed — deliverable due 2026-10-30 — no usage expiry recorded
+#8 · Meadowbrook Farms (Robin Adeyemi) — Farm-to-table short — $650.00 — paid — deliverable due 2026-09-10 — invoiced 2026-09-15 — no usage expiry recorded
+#9 · Old Mill Bakery (June Park) — Holiday campaign short — $800.00 — dead — no usage expiry recorded
+
+RIGHTS TOTALS: expired $2,000.00 (1) · expiring $1,750.00 (1) · active $1,100.00 (1) · no expiry recorded $5,800.00 (6)
+Renewal value at stake (expired + expiring): $3,750.00
+By brand (expired + expiring): Harbour Lights Hotels $2,000.00 · Summit Outdoor Co $1,750.00
+TOTALS by status: pitched $750.00 (1) · negotiating $1,200.00 (1) · agreed $2,400.00 (2) · delivered $2,000.00 (1) · invoiced $2,850.00 (2) · paid $650.00 (1) · dead $800.00 (1)
+Delivered but unpaid: $4,850.00 · Paid: $650.00
+Action items: 2 (usage expired or expiring within 30 days)
+(exit code: 1 — one window closed, one closing)
+```
+
+Read the rights view the same way: only three of the nine
+deals have a usage window recorded at all. One has already
+closed — $2,000 of content the brand may still be running
+unpaid — and one closes in 16 days, so $3,750 of renewal
+value is on the table right now. The other six deals say
+nothing about usage, and the view keeps them in their own
+bucket: unknown is not unlimited, and it is never a date
+the tool made up.
+
 One deal's full walk, verbatim:
 
 ```text
@@ -234,7 +326,7 @@ TOTALS by status: pitched $0.00 (0) · negotiating $0.00 (0) · agreed $0.00 (0)
 Delivered but unpaid: $800.00 · Paid: $0.00
 
 $ python3 src/brand_deal_pipeline.py due --board /tmp/demo-deals.json --today 2026-11-30
-brand-deal-pipeline v0.1.0 — due · board demo-deals.json · today 2026-11-30
+brand-deal-pipeline v0.2.0 — due · board demo-deals.json · today 2026-11-30
 Amounts in CAD.
 
 INVOICES TO CHASE — unpaid for 14+ days (1):
@@ -256,7 +348,7 @@ Delivered but unpaid: $0.00 · Paid: $800.00
 
 ```bash
 python3 -m unittest discover -s tests -v
-# Ran 49 tests — OK
+# Ran 77 tests — OK
 ```
 
 The suite covers both directions: the deliverable window and
@@ -272,7 +364,17 @@ real brand, deliverable and amount with no placeholders and no
 invented terms like "net-30"; a corrupt board errors cleanly
 and is left byte-identical (and `add` refuses to wipe it); and
 the JSON and text views are asserted to agree on totals,
-groups and exit codes.
+groups and exit codes. The usage windows get the same
+treatment: the expiry boundaries are checked at the exact days
+(the expiry day itself is *expiring* with 0 days left, day 30
+in / day 31 active), month arithmetic is pinned at the clamp
+cases (31 Jan + 1 month = 28 Feb, leap years included), a
+recorded expiry is proven to rule over a computed one, corrupt
+usage fields error cleanly naming the entry and the field,
+renewal lines are proven to name no price, and the sample
+board's rights buckets match hand-derived assignments
+(expired 2,000 · expiring 1,750 · active 1,100 · no-expiry
+5,800 · renewal at stake 3,750).
 
 ## Internal use
 
@@ -300,6 +402,12 @@ paid.
 - Amounts are CAD only (with optional INR display equivalents
   via `--cad-to-inr`); the board does not do multi-currency
   books.
+- Usage windows are only as real as what is recorded. The tool
+  never infers an expiry from a deliverable or invoice date; a
+  deal with no usage fields sits in NO EXPIRY RECORDED until
+  you record the terms. A computed window end (start + months)
+  is a derivation with a stated rule — day clamped to the
+  target month — not a date read from a contract.
 
 ## Privacy
 
